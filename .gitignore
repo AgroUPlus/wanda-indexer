@@ -1,0 +1,11 @@
+.env
+.wanda-cache/
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+*.bak
+*.corrupt-*
+*.rebuilt-*
+*.jsonl

@@ -1,0 +1,10 @@
+# Core requirement.
+numpy>=1.24
+
+# Needed only for YouTube Music sources; install with the system package
+# manager if you prefer (it self-updates more reliably that way).
+yt-dlp>=2024.1.1
+
+# External binaries, not installable from here:
+#   ffmpeg   - required, must be on PATH
+#   adb      - only needed for pulling/pushing the phone database

@@ -1,6 +1,6 @@
-# Wanda Indexer & App — Roadmap & What's Left To Be Done
+# Wanda Indexer & App — Roadmap & Architecture Blueprint
 
-This document tracks the current verified state of the Wanda indexing pipeline, what was accomplished, and the concrete tasks remaining across both the Android application and the desktop indexer.
+This document tracks the current verified state of the Wanda indexing pipeline, what was accomplished, and the concrete engineering roadmap across both the Android application and the desktop indexer.
 
 ---
 
@@ -11,10 +11,13 @@ This document tracks the current verified state of the Wanda indexing pipeline, 
 - **Vote-based alignment**: Implemented offset voting and refinement in both Python (`tools/check_recognition.py`) and Kotlin (`RecordingFingerprinter.kt` in the Android repo).
 - **Sub-hash index coverage**: Fixed missing index entries; previously 1,238 / 1,355 tracks lacked index entries (91% invisible). Now 100% of tracks (1,355/1,355) are indexed in `recording_sub_hashes`.
 - **Duplicate detection results**: Real library duplicate detection improved from 32 (or 44/60) to 43 of 44 duplicate pairs (59/60 app candidate pairs), with the only miss being an authentic alternate recording (*Mantis Lords*).
+- **Git Repositories & PRs**:
+  - `wanda-indexer`: Initialized, cleaned (`.gitignore`, `.env.example`, tools, tests), pushed to [`AgroUPlus/wanda-indexer:main`](https://github.com/AgroUPlus/wanda-indexer).
+  - `Wanda` (Android): Committed vote-based alignment, tests, and `MIGRATION_23_24` (`WITHOUT ROWID`); opened PR [#67](https://github.com/AgroUPlus/Wanda/pull/67).
 
 ---
 
-## 2. Outstanding Tasks & Next Steps
+## 2. Outstanding Immediate Tasks
 
 ### A. Android App Side (Kotlin / Gradle / Device)
 1. **Compile & verify Kotlin alignment changes**:
@@ -43,12 +46,12 @@ This document tracks the current verified state of the Wanda indexing pipeline, 
 
 ---
 
-## 3. Database Footprint & Schema Optimization
+## 3. Short-Term Database Optimization (Existing SQLite Architecture)
 The SQLite database currently measures **~3.38 GB for 1,355 tracks (~2.5 MB/track)**, which is heavy for pushing over USB to mobile storage.
 
 1. **`WITHOUT ROWID` on `fingerprints` table**:
    - Landmark table contains ~24M rows (2.9 GB).
-   - Switching primary index to `WITHOUT ROWID` saves duplicate B-tree overhead, cutting size down to ~2.0 GB.
+   - Switching primary index to `WITHOUT ROWID` saves duplicate B-tree overhead, cutting size down to ~2.0 GB. (Added in Android via `MIGRATION_23_24`).
 2. **Landmark density reduction**:
    - Tune peak picker / landmark density thresholds to reduce landmark rows per second without sacrificing Shazam-like microphone match accuracy.
    - Target size: low hundreds of MB.
@@ -57,22 +60,47 @@ The SQLite database currently measures **~3.38 GB for 1,355 tracks (~2.5 MB/trac
 
 ---
 
-## 4. Feature Learning & Smart Radio Optimization (GPU / Stage A & B)
-Currently, Smart Radio relies on 6 handcrafted acoustic features (tempo, energy, brightness, danceability, key x/y) weighted by fixed coefficients:
-- `TEMPO_WEIGHT = 1.6`
-- `ENERGY_WEIGHT = 1.3`
-- `BRIGHTNESS_WEIGHT = 0.8` (measured to only span 28% of range, contributing minimal signal)
-- `DANCE_WEIGHT = 1.0`
-- `KEY_WEIGHT = 0.6`
+## 4. Next-Gen Neural Audio Embeddings (Unified Stage B Roadmap)
 
-### Stage A — Weight Fitting (CPU, Minutes)
-- Use ground-truth pairs from the library (4,515 track pairs from the same album and artist).
-- Optimize feature weights via metric learning (e.g., contrastive loss / triplet loss or logistic regression) to maximize intra-album/artist similarity and spread unrelated tracks.
-- Normalize or rescale brightness to utilize its dynamic range.
+### Overview
+Instead of handcrafting DSP rules (STFT peak detection $\rightarrow$ 18,000 landmark hashes/song $\rightarrow$ 32 filterbanks $\rightarrow$ 6 hand-picked acoustic features), replace the entire feature extraction and landmark subsystem with a compact **Convolutional Neural Network (CNN)** running as a **5–10 MB TensorFlow Lite (`.tflite`) or ONNX file**.
 
-### Stage B — Learned Neural Audio Embeddings (RTX 4000 GPU, Hours)
-- Replace or augment handcrafted features with a compact learned embedding (~64–96 dimensions) trained using self-supervised contrastive learning (SimCLR / MoCo / triplet audio).
-- Augmentations: pitch shift, EQ distortion, Gaussian noise, codec re-encodes (MP3/Opus).
-- Benefits:
-  - Dramatically improves Smart Radio similarity quality.
-  - Potential to shrink fingerprint footprint from ~2.5 MB/track to < 3 KB/track (approaching Now Playing efficiency).
+### Concrete Open-Source Candidate Architectures
+1. **Google NNFP (Neural Audio Fingerprint)**:
+   - The open academic re-implementation of the exact architecture Google uses for Sound Search and Now Playing.
+   - Outputs a sequence of compact 64-bit or 128-bit hash vectors per second.
+   - Robust against heavy background noise, mic distortions, and MP3/Opus compression.
+2. **MERT / Discogs-EffNet / MusiCNN**:
+   - Audio representations trained on millions of songs.
+   - Directly maps audio segments into a dense 64-dim to 128-dim vector.
+   - Dual capability: acts as both an acoustic fingerprint and a semantic mood/vibe vector for Smart Radio.
+3. **CLMR (Contrastive Learning for Music Representation)**:
+   - Self-supervised contrastive framework (SimCLR adapted to audio).
+   - Can be easily fine-tuned or trained on consumer hardware (RTX 4070 Super) in an afternoon using audio augmentations (pitch shift, EQ, noise, MP3 round-trips).
+
+### Comparison: Current System vs. Neural Embeddings
+
+| Metric / Feature | Current System | Neural Embedding Model |
+| :--- | :--- | :--- |
+| **Size per track** | **~2.5 MB / track** (3.38 GB for 1,355 tracks) | **~256 B – 2 KB / track** (~350 KB for 1,355 tracks) |
+| **Scale to 10M tracks** | **~25 Terabytes** (impossible on mobile) | **~25 to 30 Gigabytes** (fits easily in RAM / storage) |
+| **DB Rows per track** | ~18,000 rows (24M rows for 1,355 tracks) | **1 single row** per track (`BLOB` vector column) |
+| **Sync Time to Phone** | Minutes over USB (pushing 3.4 GB) | **< 1 second** |
+| **Phone Inference Speed** | 200–800ms (SQL queries across millions of rows) | **~15ms** (running on Pixel 10 Tensor NPU) |
+| **Code Maintenance** | Fragile bit-level math parity between Python & Kotlin | **Zero parity bugs**: exact same `.tflite` model runs on both |
+
+### How It Interacts With Hum-to-Search
+- **Acoustic Fingerprints vs. Hum-to-Search**:
+  - **Acoustic Fingerprinting Models** (NNFP, MERT) listen for audio recordings (timbre, drums, mastering, vocals). They **cannot** recognize human humming, because a hum lacks the arrangement, instruments, and timbre of the studio master.
+  - **Wanda's Architecture cleanly decouples them**:
+    - `RecognitionEngine.LANDMARK` / Audio Identity: Replace with the **Neural Embedding Model**.
+    - `RecognitionEngine.MELODY` / Hum-to-Search: Retain Wanda's existing **`ContourMatcher.kt`** (Dynamic Time Warping on relative pitch intervals) or adopt **Google SPICE** (Self-Play-based Pitch Extraction for melody matching).
+
+### Step-by-Step Implementation Strategy
+1. **Desktop Pipeline (`wanda-indexer`)**:
+   - Integrate an ONNX / TFLite runtime in Python.
+   - Compute the 64/128-dim vector per track during ingestion and store as a SQLite `BLOB` in a new `track_embeddings` table.
+2. **Android Application (`Wanda`)**:
+   - Add `org.tensorflow:tensorflow-lite:2.14.0` or `com.microsoft.onnxruntime:onnxruntime-android`.
+   - Place `wanda_embedder.tflite` in `app/src/main/assets/`.
+   - Update `RecognitionRepository` to evaluate microphone clips via the TFLite interpreter and run cosine similarity across loaded library vectors.

@@ -32,8 +32,10 @@ rank-1 alone overstates recognition. The accepted count is the number that matte
 import argparse
 import os
 import random
+import re
 import subprocess
 import sys
+
 import time
 
 import numpy as np
@@ -179,22 +181,27 @@ def excerpt(samples: np.ndarray, seconds: float, offset: float) -> np.ndarray:
 class Outcome:
     """One query's result, in the terms the phone would report it."""
 
-    def __init__(self, track_id, title, ranked, titles=None):
-        accepted, best_id, similarity, margin = decide(ranked)
+    def __init__(self, track_id, title, ranked, titles=None, is_duplicate=None):
+        accepted, best_id, similarity, margin = decide(ranked, is_duplicate=is_duplicate)
         titles = titles or {}
         self.title = title
-        self.correct = best_id == track_id
+        self.correct = (best_id == track_id) or (bool(is_duplicate and is_duplicate(track_id, best_id)))
         self.accepted = accepted and self.correct
         self.similarity = similarity
         self.margin = margin
         self.matched = titles.get(best_id, best_id)
-        # Who the margin was lost to. When a correct match is rejected, this names the row that
-        # took the lead away -- usually the same recording stored twice.
-        runner_up_id = ranked[1][1] if len(ranked) > 1 else ""
+        # Who the margin was lost to. When a match is rejected, this names the row that
+        # was treated as the competitor -- the first non-duplicate recording in ranked order.
+        runner_up_id = ""
+        for _, cid in ranked[1:]:
+            if is_duplicate is None or not is_duplicate(best_id, cid):
+                runner_up_id = cid
+                break
         self.runner_up = titles.get(runner_up_id, runner_up_id)
         # Ranked first but rejected by the gate: the model found it and the thresholds threw it
         # away. Worth separating, because the fix is a threshold, not a better model.
         self.gated_out = self.correct and not accepted
+
 
 
 def report(condition: str, outcomes, detail: bool = False) -> None:
@@ -297,6 +304,22 @@ def main(argv=None):
     # Every indexed track, not only the sampled ones: a query can lose its margin to any row in
     # the catalogue, and naming it is the point of the detail output.
     titles = {t["id"]: f"{t['artist']} - {t['title']}" for t in tracks}
+
+    def norm_tag(s: str) -> str:
+        s = s.replace("’", "'").replace("'", "").lower()
+        return re.sub(r"[^\w\s]", "", s).strip()
+
+    norm_meta = {t["id"]: (norm_tag(t["artist"]), norm_tag(t["title"])) for t in tracks}
+
+    def is_duplicate(a: str, b: str) -> bool:
+        if a == b:
+            return True
+        ma, mb = norm_meta.get(a), norm_meta.get(b)
+        if not ma or not mb:
+            return False
+        return ma == mb
+
+
     rng.shuffle(tracks)
     tracks = tracks[: args.limit]
 
@@ -343,7 +366,8 @@ def main(argv=None):
         if len(query) == 0:
             return None
         return Outcome(track["id"], f"{track['artist']} - {track['title']}",
-                       rank(query, catalogue), titles)
+                       rank(query, catalogue), titles, is_duplicate=is_duplicate)
+
 
     print(f"\n[TEST]  query {args.seconds:.0f}s, drawn from the first {INDEXED_SECONDS}s\n")
 

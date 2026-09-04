@@ -10,7 +10,7 @@ separability check (`tools/check_embedding_recognition.py`) and the degraded-aud
 (`tools/field_test_recognition.py`). They previously carried their own copies, which is exactly
 how two tools start disagreeing about what a match is.
 """
-from typing import Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -67,16 +67,29 @@ def rank(query: np.ndarray,
     return sorted(((score(query, vectors), tid) for tid, vectors in catalogue), reverse=True)
 
 
-def decide(ranked: Sequence[Tuple[float, str]]) -> Tuple[bool, str, float, float]:
+def decide(ranked: Sequence[Tuple[float, str]],
+           is_duplicate: Optional[Callable[[str, str], bool]] = None
+           ) -> Tuple[bool, str, float, float]:
     """Apply the phone's gate to a ranking.
 
     Returns `(accepted, track_id, similarity, margin)`. `accepted` is what the user would
     actually see: a name, or "not found".
+
+    When `is_duplicate` is provided, runner-up candidates representing the same recording
+    as the winner are skipped so duplicates do not steal the margin.
     """
     if not ranked:
         return False, "", 0.0, 0.0
     best_score, best_id = ranked[0]
-    runner_up = ranked[1][0] if len(ranked) > 1 else 0.0
+    if is_duplicate is None:
+        runner_up = ranked[1][0] if len(ranked) > 1 else 0.0
+    else:
+        runner_up = 0.0
+        for score_val, candidate_id in ranked[1:]:
+            if not is_duplicate(best_id, candidate_id):
+                runner_up = score_val
+                break
     margin = best_score - runner_up
     accepted = best_score >= MIN_SIMILARITY and margin >= MIN_MARGIN
     return accepted, best_id, best_score, margin
+

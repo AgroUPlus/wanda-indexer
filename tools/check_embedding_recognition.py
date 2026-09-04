@@ -79,6 +79,15 @@ def main(argv=None):
     # 3. Rank-1 retrieval: a window from the middle of each track, matched against
     #    every track the way RecognitionRepository.match does on the phone.
     titles = dict(conn.execute("SELECT id, artist || ' - ' || title FROM tracks").fetchall())
+    meta_rows = conn.execute("SELECT id, lower(trim(artist)), lower(trim(title)) FROM tracks").fetchall()
+    norm_meta = {r[0]: (r[1] or "", r[2] or "") for r in meta_rows}
+
+    def is_duplicate(a: str, b: str) -> bool:
+        if a == b:
+            return True
+        ma, mb = norm_meta.get(a), norm_meta.get(b)
+        return bool(ma and mb and ma == mb)
+
     win = args.window          # query segments, 0.5 s each -> default 12 == 6 s
     catalogue = [(tid, emb[tid]) for tid in ids if len(emb[tid]) >= win + 4]
 
@@ -93,12 +102,18 @@ def main(argv=None):
             reverse=True,
         )
         best_score, best_id = ranked[0]
-        runner = ranked[1][0] if len(ranked) > 1 else 0.0
-        if best_id == tid:
+        runner = 0.0
+        for s_val, other_id in ranked[1:]:
+            if not is_duplicate(best_id, other_id):
+                runner = s_val
+                break
+
+        if best_id == tid or is_duplicate(best_id, tid):
             top1 += 1
             margins.append(best_score - runner)
         else:
             misses.append((titles.get(tid, tid), best_score, titles.get(best_id, best_id)))
+
 
     n = len(catalogue)
     print(f"\n[3] Rank-1 retrieval (query = {win/2:.0f}s from mid-track, {n} tracks):")

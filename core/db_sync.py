@@ -19,11 +19,54 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from core.embedder import EMBED_DIM, EMBEDDER_VERSION, MODEL_NAME as EMBED_MODEL_NAME
 from core.fingerprinter import sub_hash_halves
 
 EXTRACTOR_VERSION = 1
 DEFAULT_PACKAGE = "com.wander.android.debug"
 BUSY_TIMEOUT_MS = 30000
+
+# Kept byte-for-byte in step with Room's generated DDL for `TrackEmbeddingEntity`
+# (Android MIGRATION_24_25). The desktop indexer may run against a database whose
+# app has not been updated yet, so it creates the table itself if missing; Room's
+# migration uses the identical `CREATE TABLE IF NOT EXISTS`, so either order works.
+EMBEDDINGS_DDL = (
+    "CREATE TABLE IF NOT EXISTS track_embeddings ("
+    "trackId TEXT NOT NULL, vector BLOB NOT NULL, dim INTEGER NOT NULL, "
+    "model TEXT NOT NULL, version INTEGER NOT NULL, computedAt INTEGER NOT NULL, "
+    "PRIMARY KEY(trackId))"
+)
+
+
+def ensure_embeddings_table(conn: sqlite3.Connection) -> None:
+    conn.execute(EMBEDDINGS_DDL)
+
+
+# Byte-for-byte the table Room validates at schema version 25 — see
+# `app/schemas/com.wander.android.core.database.WanderDatabase/25.json`.
+LANDMARKS_DDL = (
+    "CREATE TABLE IF NOT EXISTS `fingerprints` ("
+    "`hash` INTEGER NOT NULL, `trackId` TEXT NOT NULL, `anchorFrame` INTEGER NOT NULL, "
+    "PRIMARY KEY(`hash`, `trackId`, `anchorFrame`))"
+)
+LANDMARKS_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS `index_fingerprints_trackId` ON `fingerprints` (`trackId`)"
+)
+
+
+def ensure_landmarks_table(conn: sqlite3.Connection) -> None:
+    """Recreates `fingerprints` empty if the cut-over dropped it.
+
+    Nothing reads the landmark index any more, but the app still declares `FingerprintEntity` at
+    schema version 25, and Room validates the whole schema when it opens the file. A database
+    missing the table is rejected, and `DefaultDatabaseErrorHandler` responds to a rejection by
+    deleting the database — so pushing one would silently wipe the phone's library.
+
+    An empty table satisfies the check at a cost of one page. Once the landmark code is removed
+    from the app and the schema bumped to drop the entity, this can go with it.
+    """
+    conn.execute(LANDMARKS_DDL)
+    conn.execute(LANDMARKS_INDEX_DDL)
 
 
 # --------------------------------------------------------------------------
@@ -112,11 +155,17 @@ def quick_sanity(db_path: str) -> Tuple[bool, List[str]]:
     problems = []
     try:
         conn.execute("SELECT count(*) FROM sqlite_master;").fetchone()
-        for table in ("tracks", "fingerprints", "track_features", "recording_fingerprints"):
+        for table in ("tracks", "track_features", "recording_fingerprints"):
             try:
                 conn.execute(f"SELECT count(*) FROM {table};").fetchone()
             except sqlite3.DatabaseError as exc:
                 problems.append(f"table {table} is unreadable: {exc}")
+        # `fingerprints` is not probed: the landmark constellation has been replaced by the
+        # neural embedding, and a database that has had it dropped is the intended end state,
+        # not a damaged one. Probing it here reported every cut-over database as corrupt.
+        #
+        # track_embeddings is created on demand by the indexer; a database whose
+        # app predates it is not corrupt, so it is not in the probe list above.
     except sqlite3.DatabaseError as exc:
         problems.append(f"schema is unreadable: {exc}")
     finally:
@@ -596,7 +645,9 @@ class StagedDatabase:
 # Work discovery
 # --------------------------------------------------------------------------
 
-def get_pending_tracks(db_path: str, version: int = EXTRACTOR_VERSION) -> List[Dict[str, Any]]:
+def get_pending_tracks(db_path: str, version: int = EXTRACTOR_VERSION,
+                       want_embeddings: bool = False,
+                       embedder_version: int = EMBEDDER_VERSION) -> List[Dict[str, Any]]:
     """Tracks missing any part of their index, with per-stage flags.
 
     The old implementation used a pair of `id NOT IN (SELECT ...)` subqueries.
@@ -607,25 +658,64 @@ def get_pending_tracks(db_path: str, version: int = EXTRACTOR_VERSION) -> List[D
     """
     conn = connect(db_path, readonly=True)
     conn.row_factory = sqlite3.Row
+    # A database whose app predates the embedding feature has no track_embeddings
+    # table; the indexer creates it at write time (batch_insert_index_data), and
+    # until then every track counts as needing an embedding.
+    has_table = bool(conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='track_embeddings';"
+    ).fetchone())
+
+    # The landmark constellation is gone from any database that has been through the cut-over, so
+    # the join that reports it has to be optional in exactly the way the embedding join already is.
+    # Without this the whole scan died with "no such table: fingerprints".
+    has_landmarks = bool(conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='fingerprints';"
+    ).fetchone())
+    if has_landmarks:
+        landmark_column = "(fp.trackId IS NULL) AS needs_landmarks"
+        landmark_join = ("LEFT JOIN (SELECT DISTINCT trackId FROM fingerprints) fp "
+                         "ON fp.trackId = t.id")
+        landmark_where = "fp.trackId IS NULL OR"
+    else:
+        landmark_column = "0 AS needs_landmarks"
+        landmark_join = ""
+        landmark_where = ""
+
+    if not want_embeddings:
+        embed_column = "0 AS needs_embedding"
+        embed_join = ""
+        embed_where = ""
+    elif has_table:
+        embed_column = "(te.trackId IS NULL) AS needs_embedding"
+        embed_join = ("LEFT JOIN (SELECT trackId FROM track_embeddings WHERE version = :ev) te "
+                      "ON te.trackId = t.id")
+        embed_where = "OR te.trackId IS NULL"
+    else:
+        embed_column = "1 AS needs_embedding"
+        embed_join = ""
+        embed_where = "OR 1"
+
     try:
         rows = conn.execute(
-            """
+            f"""
             SELECT t.id, t.sourceTrackId, t.source, t.title, t.artist, t.album,
                    t.durationMs, t.streamUri, t.localFilePath,
-                   (fp.trackId IS NULL) AS needs_landmarks,
+                   {landmark_column},
                    (tf.trackId IS NULL) AS needs_features,
-                   (rf.trackId IS NULL) AS needs_recording_fp
+                   (rf.trackId IS NULL) AS needs_recording_fp,
+                   {embed_column}
             FROM tracks t
-            LEFT JOIN (SELECT DISTINCT trackId FROM fingerprints) fp
-                   ON fp.trackId = t.id
-            LEFT JOIN (SELECT trackId FROM track_features WHERE version = ?) tf
+            {landmark_join}
+            LEFT JOIN (SELECT trackId FROM track_features WHERE version = :v) tf
                    ON tf.trackId = t.id
             LEFT JOIN recording_fingerprints rf
                    ON rf.trackId = t.id
-            WHERE fp.trackId IS NULL OR tf.trackId IS NULL OR rf.trackId IS NULL
+            {embed_join}
+            WHERE {landmark_where} tf.trackId IS NULL OR rf.trackId IS NULL
+                  {embed_where}
             ORDER BY t.source, t.id;
             """,
-            (version,),
+            {"v": version, "ev": embedder_version},
         ).fetchall()
     finally:
         conn.close()
@@ -635,6 +725,7 @@ def get_pending_tracks(db_path: str, version: int = EXTRACTOR_VERSION) -> List[D
         track = dict(row)
         for flag in ("needs_landmarks", "needs_features", "needs_recording_fp"):
             track[flag] = bool(track[flag])
+        track["needs_embedding"] = bool(want_embeddings and track["needs_embedding"])
         pending.append(track)
     return pending
 
@@ -734,7 +825,8 @@ def count_index_rows(db_path: str) -> Dict[str, Optional[int]]:
     conn = connect(db_path, readonly=True)
     counts: Dict[str, Optional[int]] = {}
     try:
-        for table in ("tracks", "fingerprints", "track_features", "recording_fingerprints"):
+        for table in ("tracks", "fingerprints", "track_features",
+                      "recording_fingerprints", "track_embeddings"):
             try:
                 counts[table] = conn.execute(f"SELECT count(*) FROM {table};").fetchone()[0]
             except sqlite3.DatabaseError:
@@ -753,11 +845,20 @@ def batch_insert_index_data(
     landmarks_by_track: Dict[str, List[Tuple[int, int]]],
     features_by_track: Dict[str, Dict[str, float]],
     recording_fps_by_track: Dict[str, bytes],
+    embeddings_by_track: Optional[Dict[str, bytes]] = None,
     version: int = EXTRACTOR_VERSION,
+    embedder_version: int = EMBEDDER_VERSION,
 ) -> Dict[str, int]:
     """Commits one checkpoint atomically. Returns counts of rows written."""
+    embeddings_by_track = embeddings_by_track or {}
     conn = connect(db_path)
     now_ms = int(time.time() * 1000)
+
+    embedding_rows = [
+        (track_id, blob, EMBED_DIM, EMBED_MODEL_NAME, embedder_version, now_ms)
+        for track_id, blob in embeddings_by_track.items()
+        if blob
+    ]
 
     landmark_rows = [
         (packed_hash, track_id, anchor_frame)
@@ -787,6 +888,14 @@ def batch_insert_index_data(
 
     try:
         with conn:  # one transaction: commits together or rolls back together
+            if embedding_rows:
+                ensure_embeddings_table(conn)
+                conn.executemany(
+                    "INSERT OR REPLACE INTO track_embeddings "
+                    "(trackId, vector, dim, model, version, computedAt) "
+                    "VALUES (?, ?, ?, ?, ?, ?);",
+                    embedding_rows,
+                )
             if landmark_rows:
                 conn.executemany(
                     "INSERT OR IGNORE INTO fingerprints (hash, trackId, anchorFrame) "
@@ -826,7 +935,92 @@ def batch_insert_index_data(
         "features": len(feature_rows),
         "recordings": len(rec_rows),
         "sub_hashes": len(half_rows),
+        "embeddings": len(embedding_rows),
     }
+
+
+def shrink_fingerprints_table(db_path: str, log=print) -> dict:
+    """Converts `fingerprints` to WITHOUT ROWID, matching Android MIGRATION_23_24.
+
+    Room's schema validator reads `PRAGMA table_info` / `index_list`, and neither can see
+    `WITHOUT ROWID` -- it is pure DDL, invisible to those pragmas. So this desktop rewrite and the
+    on-device migration are only required to agree on the observable part: the same columns, the
+    same primary key, and the same remaining index (`trackId`; `hash` is dropped because the
+    primary key's hash-first order already serves it). Get that right and Room accepts either path
+    to get there without caring which one actually ran.
+
+    Does the 24M-row rewrite here rather than as an on-device migration for the same reason
+    everything else in this module stages locally first: SQLite migrating a table this size inside
+    the app at first-launch-after-update is slow and a poor first experience, and a desktop CPU
+    does it while nobody is waiting on it.
+
+    After this, `PRAGMA user_version` is set to 24 so Room recognises the database as already
+    migrated and MIGRATION_23_24 is a no-op should it ever run against this file.
+    """
+    conn = connect(db_path)
+    try:
+        before = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'fingerprints';"
+        ).fetchone()
+        if before and "WITHOUT ROWID" in before[0].upper():
+            log("[SHRINK] fingerprints is already WITHOUT ROWID; nothing to do.")
+            return {"rows": 0, "skipped": True}
+
+        row_count = conn.execute("SELECT count(*) FROM fingerprints;").fetchone()[0]
+        log(f"[SHRINK] Rewriting {row_count:,} landmark rows as WITHOUT ROWID ...")
+        started = time.time()
+
+        with conn:
+            conn.execute(
+                """
+                CREATE TABLE fingerprints_new (
+                    hash INTEGER NOT NULL,
+                    trackId TEXT NOT NULL,
+                    anchorFrame INTEGER NOT NULL,
+                    PRIMARY KEY (hash, trackId, anchorFrame)
+                ) WITHOUT ROWID;
+                """
+            )
+            conn.execute(
+                "INSERT INTO fingerprints_new (hash, trackId, anchorFrame) "
+                "SELECT hash, trackId, anchorFrame FROM fingerprints;"
+            )
+            conn.execute("DROP INDEX IF EXISTS index_fingerprints_hash;")
+            conn.execute("DROP TABLE fingerprints;")
+            conn.execute("ALTER TABLE fingerprints_new RENAME TO fingerprints;")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS index_fingerprints_trackId "
+                "ON fingerprints (trackId);"
+            )
+            # Matches Android's @Database(version = 24): a mismatch here would make Room
+            # re-run MIGRATION_23_24 on first open, safely a no-op given the guard above, but
+            # setting it correctly avoids that redundant multi-second pass on the phone.
+            conn.execute("PRAGMA user_version = 24;")
+
+        after_count = conn.execute("SELECT count(*) FROM fingerprints;").fetchone()[0]
+        if after_count != row_count:
+            raise RuntimeError(
+                f"row count changed during rewrite: {row_count:,} -> {after_count:,}; "
+                "refusing to treat this as safe"
+            )
+
+        log(f"[SHRINK] Done in {time.time() - started:.0f}s. Run VACUUM to reclaim the freed pages.")
+        return {"rows": after_count, "skipped": False}
+    finally:
+        conn.close()
+
+
+def vacuum(db_path: str, log=print) -> None:
+    """Reclaims freed pages. Needed after shrink_fingerprints_table: dropping the old table and
+    its index leaves the pages allocated in the file until this runs."""
+    log("[VACUUM] Reclaiming freed space (this rewrites the whole file; may take a while) ...")
+    started = time.time()
+    conn = connect(db_path)
+    try:
+        conn.execute("VACUUM;")
+    finally:
+        conn.close()
+    log(f"[VACUUM] Done in {time.time() - started:.0f}s.")
 
 
 # --------------------------------------------------------------------------
@@ -951,6 +1145,78 @@ def pull_database(local_db_path: str, package: str = DEFAULT_PACKAGE,
     return False
 
 
+# What the user made, as opposed to what the indexer derived.
+#
+# These live as *columns on `tracks`* rather than in a table of their own, which is the whole
+# reason a push is dangerous: replacing the database file to deliver new fingerprints also
+# replaces every like and play count with whatever the desktop copy happened to hold.
+USER_TRACK_COLUMNS = (
+    "isLiked", "isDownloaded", "isCached", "localFilePath", "playCount",
+    "lastPlayedTimestamp", "addedTimestamp", "isLibrary", "contentHash",
+)
+
+# Tables owned entirely by the user or the device. `drops` is included even though it carries no
+# track id -- it stores its own title/contentHash, so it survives independently.
+USER_TABLES = (
+    "history", "local_playlists", "recording_splits", "canonical_metadata", "drops",
+)
+
+
+def merge_user_data(source_db: str, target_db: str, log=print) -> Dict[str, int]:
+    """Carries the user's own data from `source_db` (the phone) into `target_db`.
+
+    Run before a push. The desktop database is authoritative for everything the indexer
+    computes and for nothing else: likes, play counts, history and drops only ever happen on the
+    phone, so a push that does not bring them across silently reverts them to whatever the last
+    pull captured.
+
+    Rows pointing at a track the target does not have are counted and reported rather than
+    dropped in silence -- that count is the signal that the two libraries have diverged.
+    """
+    counts: Dict[str, int] = {}
+    conn = connect(target_db)
+    try:
+        conn.execute("ATTACH DATABASE ? AS phone", (source_db,))
+        try:
+            columns = ", ".join(f"{c} = (SELECT p.{c} FROM phone.tracks p WHERE p.id = tracks.id)"
+                                for c in USER_TRACK_COLUMNS)
+            cur = conn.execute(
+                f"UPDATE tracks SET {columns} "
+                "WHERE id IN (SELECT id FROM phone.tracks)"
+            )
+            counts["tracks"] = cur.rowcount
+
+            orphans = conn.execute(
+                "SELECT count(*) FROM phone.tracks p "
+                "WHERE p.id NOT IN (SELECT id FROM tracks)"
+            ).fetchone()[0]
+            if orphans:
+                counts["tracks_only_on_phone"] = orphans
+                log(f"[MERGE] {orphans} track(s) exist only on the phone; "
+                    "their user data cannot be carried over.")
+
+            for table in USER_TABLES:
+                exists = conn.execute(
+                    "SELECT 1 FROM phone.sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                ).fetchone()
+                if not exists:
+                    continue
+                conn.execute(f"DELETE FROM main.{table}")
+                cur = conn.execute(f"INSERT INTO main.{table} SELECT * FROM phone.{table}")
+                counts[table] = cur.rowcount
+
+            conn.commit()
+        finally:
+            conn.execute("DETACH DATABASE phone")
+    finally:
+        conn.close()
+
+    summary = ", ".join(f"{v} {k}" for k, v in counts.items() if v)
+    log(f"[MERGE] Carried over from the phone: {summary or 'nothing'}")
+    return counts
+
+
 def push_database(local_db_path: str, package: str = DEFAULT_PACKAGE,
                   db_name: str = "wanda_music.db", log=print) -> bool:
     """Streams the updated database back and force-stops the app so Room rereads it."""
@@ -964,6 +1230,12 @@ def push_database(local_db_path: str, package: str = DEFAULT_PACKAGE,
 
     log(f"[DB] Pushing {local_db_path} to {package} ...")
     adb = get_adb_binary()
+    # Stopped *before* the write, not only after. A running app holds the database open and keeps
+    # writing to its own write-ahead log; replacing the file underneath it leaves that log
+    # describing pages that no longer exist, SQLite reports corruption on the next open, and
+    # `DefaultDatabaseErrorHandler` answers a corruption report by deleting the database. The
+    # result is a push that appears to succeed and then destroys the library on the phone.
+    run_adb_command(["shell", "am", "force-stop", package])
     try:
         with open(local_db_path, "rb") as src:
             res = subprocess.run(
@@ -979,9 +1251,18 @@ def push_database(local_db_path: str, package: str = DEFAULT_PACKAGE,
         log(f"[DB] Push failed: {res.stderr.decode('utf-8', 'replace').strip()}")
         return False
 
-    # Room keeps its own -wal/-shm; stale ones would shadow the new file.
-    run_adb_command(["shell", "run-as", package, "sh", "-c",
-                     f"rm -f databases/{db_name}-wal databases/{db_name}-shm"])
-    run_adb_command(["shell", "am", "force-stop", package])
+    # Room keeps its own -wal/-shm, and a stale pair left beside a freshly written database is
+    # read as a log of changes to make to it — which is how a good push turns into a corruption
+    # report. Removed one file per command: some device shells reject `rm` with several operands
+    # ("rm: Needs 1 argument"), and the grouped form failed silently enough to look like it worked.
+    for suffix in ("-wal", "-shm"):
+        run_adb_command(["shell", "run-as", package, "rm", "-f",
+                         f"databases/{db_name}{suffix}"])
+
+    # Reported because a push that lands and is then deleted looks identical to one that worked;
+    # the size on the device is the only cheap proof it survived.
+    _, listing, _ = run_adb_command(["shell", "run-as", package, "ls", "-l",
+                                     f"databases/{db_name}"])
+    log(f"[DB] On device: {listing}")
     log("[DB] Pushed. Reopen Wanda on the phone to pick up the new index.")
     return True

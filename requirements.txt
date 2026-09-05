@@ -1,6 +1,15 @@
 # Core requirement.
 numpy>=1.24
 
+# The neural fingerprint -- the index the app actually searches. Without a TFLite
+# runtime the indexer still runs and still writes the legacy analyses, but the
+# embeddings it skips are the ones recognition needs, so install one.
+#   ai-edge-litert is Google's current wheel and covers Linux/macOS/Windows.
+#   tflite-runtime is the older name, still right on a Raspberry Pi.
+# A full `tensorflow` install also works and is what --embedder-model expects to
+# find if you already have one.
+ai-edge-litert>=1.0; python_version >= "3.9"
+
 # Needed only for YouTube Music sources; install with the system package
 # manager if you prefer (it self-updates more reliably that way).
 yt-dlp>=2024.1.1

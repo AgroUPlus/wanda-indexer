@@ -1,14 +1,20 @@
 # Wanda Desktop Indexer
 
-Computes Shazam-style landmark hashes, 6D KNN features, and canonical recording
-fingerprints for your music library on a PC, and writes them into the same
-SQLite database the Wanda Android app uses — so the phone gets instant
-recognition and Smart Radio without doing the work itself.
+Computes **neural audio fingerprints** — plus 6D KNN features, and the legacy
+landmark hashes where the database still has a table for them — for your music
+library on a PC, and writes them into the same SQLite database the Wanda Android
+app uses, so the phone gets instant recognition and Smart Radio without doing
+the work itself.
+
+The phone can do this on its own, one streamed track at a time, at roughly 35
+seconds a track. Here it is closer to one *per* second, because the network is
+the only real cost and six of them run at once: a 1400-track library is about
+twenty minutes instead of thirteen hours.
 
 ## Quick start
 
 ```bash
-pip install -r requirements.txt      # numpy, yt-dlp
+pip install -r requirements.txt      # numpy, yt-dlp, ai-edge-litert
 sudo apt install ffmpeg              # required; brew install ffmpeg on macOS
 
 cp .env.example .env                 # then fill in your Navidrome details
@@ -21,19 +27,44 @@ cp .env.example .env                 # then fill in your Navidrome details
 On Windows, use `run_windows.bat` (same arguments), or `sync_indexer.bat` for
 the guided pull → index → push workflow.
 
+## What it writes
+
+`track_embeddings` is the one that matters: a 128-dimensional vector per half
+second of audio, from the same `wanda_embedder.tflite` the app downloads, plus
+one summary vector per 30-second chunk that the phone uses to shortlist a
+search before it opens anything. Everything else here predates it and is written
+only where the database still has the table — a current app has dropped
+`fingerprints` and the recording tables entirely.
+
+Two details are contracts with the app, not choices, and `core/embedder.py`
+documents both: **whole tracks** (indexing used to stop at 60 seconds, which is
+why a clip from a song's third minute could not be recognised and why a reported
+position could never exceed 59 seconds), and **int8 storage** at a scale of 255
+(a quarter the size, with a worst-case effect on a match score of 0.002 against
+thresholds spaced 0.04 apart).
+
+`tools/check_parity.py` is how you confirm the two sides agree — it feeds the
+exact clip the phone captured through this code and compares the vectors.
+
 ## How it works
 
 Indexing is **network-bound, not CPU-bound**. Resolving and streaming a track
-takes seconds; the DSP takes about 0.05s. So the pipeline is:
+takes seconds; the embedding takes about 1.3s for a minute of audio, and the
+legacy DSP about 0.05s. So the pipeline is:
 
 ```
    [ I/O pool: 6 threads ]            [ CPU pool: N processes ]
-   resolve URL -> ffmpeg decode  -->  one STFT -> landmarks
-   (self-throttling, cached)                  -> 6D features
+   resolve URL -> ffmpeg decode  -->  neural embedding (whole track)
+   (self-throttling, cached)          one STFT -> landmarks
+                                              -> 6D features
                                               -> recording fingerprint
                                                     |
                                           checkpoint every 25 tracks
 ```
+
+Each CPU worker builds its own TFLite interpreter, lazily. An interpreter holds
+native state that does not survive `fork`, so one created before the pool starts
+is a segfault waiting for the first worker to use it.
 
 - **One STFT per track**, shared by all three analyses instead of three separate
   transforms (`core/spectrogram.py`).
@@ -59,7 +90,7 @@ Wanda Indexer  ·  1355 tracks  ·  io 6/6  ·  cpu 8  ·  elapsed 04:12  ·  et
 ────────────────────────────────────────────────────────────────────────────────
  io#1   resolve    ytm Melanie Martinez - DEATH                            2.4s
  io#2   decode     nav Sabrina Carpenter - Taste                          11.2s
- io#3   landmarks  ytm natori - Overdose                                   0.1s
+ io#3   embedding  ytm natori - Overdose                                   1.4s
 ────────────────────────────────────────────────────────────────────────────────
  failures  RATE_LIMITED 9 · UNAVAILABLE 3 · DECODE_TIMEOUT 2
 ```

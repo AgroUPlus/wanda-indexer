@@ -28,7 +28,8 @@ from collections import defaultdict, deque
 from typing import Dict, Optional
 
 # Pipeline stages in the order a track passes through them.
-STAGES = ("queued", "resolve", "decode", "landmarks", "features", "recording", "commit")
+STAGES = ("queued", "resolve", "decode", "embedding", "landmarks", "features",
+          "recording", "commit")
 
 _BAR_FULL = "█"
 _BAR_EMPTY = "░"

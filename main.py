@@ -63,6 +63,11 @@ def track_label(track: dict) -> str:
 # CPU stage (runs in worker processes)
 # --------------------------------------------------------------------------
 
+# How much of a track the legacy STFT analyses see. See `analyse_samples`.
+HEAD_SECONDS = 60
+SAMPLE_RATE = 8000
+
+
 def _init_cpu_worker() -> None:
     """Pin each worker to one BLAS thread.
 
@@ -76,7 +81,8 @@ def _init_cpu_worker() -> None:
 
 
 def analyse_samples(samples, needs_landmarks: bool, needs_features: bool,
-                    needs_recording: bool) -> dict:
+                    needs_recording: bool, needs_embedding: bool = False,
+                    embedder_model: str = "", cache_dir: str = "") -> dict:
     """Runs the DSP over decoded PCM. Executed in a worker process."""
     # Imported here so the parent process never pays for them when --cpu-workers
     # spawns fresh interpreters.
@@ -85,12 +91,33 @@ def analyse_samples(samples, needs_landmarks: bool, needs_features: bool,
     from core.spectrogram import compute_stft, frame_count_for
 
     timings = {}
-    # One STFT, shared by all three consumers instead of three separate ones.
-    started = time.time()
-    stft = compute_stft(samples, frame_count_for(len(samples)))
-    timings["t_stft"] = time.time() - started
+    result = {"landmarks": [], "features": None, "recording_fp": b"", "embedding": None}
 
-    result = {"landmarks": [], "features": None, "recording_fp": b""}
+    # The neural fingerprint first, and on the *whole* decode. It is the only
+    # index the app still searches, and unlike the three below it wants the
+    # entire track: a clip taken from a song's third minute has no counterpart
+    # in vectors that stop at its first.
+    if needs_embedding:
+        from core import embedder as emb
+        started = time.time()
+        vectors = emb.embed(samples, cache_dir or ".wanda-cache", embedder_model)
+        if len(vectors):
+            result["embedding"] = (emb.pack(vectors), emb.pack(emb.summary(vectors)))
+        timings["t_embedding"] = time.time() - started
+
+    if not (needs_landmarks or needs_features or needs_recording):
+        result["timings"] = timings
+        return result
+
+    # The legacy analyses share one STFT, and share the *head* of the decode:
+    # they were measured over the first minute and their stored `version` says
+    # so, so handing them a whole track would silently change every number they
+    # have written. Mirrors what `FingerprintIndexWorker` does on the phone.
+    head = samples[: HEAD_SECONDS * SAMPLE_RATE]
+    started = time.time()
+    stft = compute_stft(head, frame_count_for(len(head)))
+    timings["t_stft"] = time.time() - started
+    samples = head
 
     if needs_landmarks:
         started = time.time()
@@ -234,8 +261,25 @@ def preflight(args, write=print) -> bool:
         return False
 
     counts = db_sync.count_index_rows(args.db)
-    write(f"[DB]    tracks {counts['tracks']:,} | fingerprints {counts['fingerprints']:,} | "
-          f"features {counts['track_features']:,} | recordings {counts['recording_fingerprints']:,}")
+    # None where the app's schema has dropped the table -- a current database has
+    # no `fingerprints` or recording tables at all, and that is not a fault.
+    present = ", ".join(
+        f"{name} {count:,}" for name, count in counts.items() if count is not None
+    )
+    write(f"[DB]    {present}")
+
+    total, indexed, complete = db_sync.embedding_coverage(args.db)
+    write(f"[DB]    embeddings: {indexed:,} of {total:,} tracks, {complete:,} reaching the "
+          f"end of the track")
+    if indexed and complete < indexed:
+        write(f"        {indexed - complete:,} stop short and will be re-measured "
+              f"(indexing used to read only the first minute)")
+    try:
+        from core import embedder
+        embedder.model_path(args.cache_dir, args.embedder_model)
+        write("[MODEL] wanda_embedder.tflite present and verified")
+    except embedder.EmbedderUnavailable as exc:
+        write(f"[WARN]  embeddings unavailable: {exc}")
     if args.check:
         # An explicit check is allowed to pay for the full verification; the
         # indexing path gets it for free on the local working copy instead.
@@ -281,8 +325,14 @@ def parse_args(argv=None):
     parser.add_argument("--limit", type=int, default=0, help="Process at most N tracks (0 = all)")
     parser.add_argument("--source", action="append", default=[], metavar="NAME",
                         help="Only index these sources (e.g. --source NAVIDROME); repeatable")
-    parser.add_argument("--seconds", type=int, default=60,
-                        help="Seconds of audio to analyse per track")
+    parser.add_argument("--no-embeddings", action="store_true",
+                        help="Skip the neural fingerprint (the index the app searches)")
+    parser.add_argument("--embedder-model", default="",
+                        help="Path to wanda_embedder.tflite; downloaded and cached if omitted")
+    parser.add_argument("--seconds", type=int, default=1200,
+                        help="Seconds of each track to read (default: 20 minutes, i.e. all of "
+                             "it). Was 60, which is why stored vectors describe only a song's "
+                             "opening and a clip from later in one cannot be recognised.")
 
     parser.add_argument("--navidrome-url", default=os.getenv("NAVIDROME_URL"))
     parser.add_argument("--navidrome-user", default=os.getenv("NAVIDROME_USER"))
@@ -389,6 +439,17 @@ def main(argv=None) -> int:
     if args.limit > 0:
         pending = pending[: args.limit]
 
+    if args.no_embeddings:
+        for track in pending:
+            track["needs_embedding"] = False
+        pending = [t for t in pending if any(
+            t.get(f) for f in ("needs_landmarks", "needs_features", "needs_recording_fp")
+        )]
+    else:
+        for track in pending:
+            track["embedder_model"] = args.embedder_model
+            track["cache_dir"] = args.cache_dir
+
     total = len(pending)
     by_source = {}
     for track in pending:
@@ -405,9 +466,10 @@ def main(argv=None) -> int:
         for track in pending[:10]:
             needs = [
                 name for name, flag in (
-                    ("landmarks", track["needs_landmarks"]),
-                    ("features", track["needs_features"]),
-                    ("recording", track["needs_recording_fp"]),
+                    ("embedding", track.get("needs_embedding")),
+                    ("landmarks", track.get("needs_landmarks")),
+                    ("features", track.get("needs_features")),
+                    ("recording", track.get("needs_recording_fp")),
                 ) if flag
             ]
             print(f"  - [{track['source']}] {track_label(track)}  "
@@ -501,8 +563,10 @@ def run_pipeline(args, pending, resolver, limiter, cache, reporter,
     buffered_landmarks = {}
     buffered_features = {}
     buffered_recordings = {}
+    buffered_embeddings = {}
     buffered_tracks = set()
-    buffers = (buffered_landmarks, buffered_features, buffered_recordings, buffered_tracks)
+    buffers = (buffered_landmarks, buffered_features, buffered_recordings,
+               buffered_embeddings, buffered_tracks)
     commit_lock = threading.Lock()
 
     def commit_buffer(force: bool = False) -> None:
@@ -510,13 +574,15 @@ def run_pipeline(args, pending, resolver, limiter, cache, reporter,
             if not buffered_tracks:
                 return
             counts = db_sync.batch_insert_index_data(
-                args.db, buffered_landmarks, buffered_features, buffered_recordings
+                args.db, buffered_landmarks, buffered_features, buffered_recordings,
+                buffered_embeddings
             )
             counts["tracks"] = len(buffered_tracks)
             reporter.checkpoint(counts)
             buffered_landmarks.clear()
             buffered_features.clear()
             buffered_recordings.clear()
+            buffered_embeddings.clear()
             buffered_tracks.clear()
 
     # Ctrl+C sets a flag; the loop drains and commits rather than dying mid-write.
@@ -577,7 +643,7 @@ def run_pipeline(args, pending, resolver, limiter, cache, reporter,
                         cpu_pool = _handle_analysis_result(
                             future, track, timings, reporter,
                             buffered_landmarks, buffered_features, buffered_recordings,
-                            buffered_tracks, cpu_pool, cpu_workers,
+                            buffered_embeddings, buffered_tracks, cpu_pool, cpu_workers,
                         )
                         if len(buffered_tracks) >= args.batch_size:
                             commit_buffer()
@@ -636,13 +702,16 @@ def _handle_fetch_result(future, track, reporter, cpu_pool, cpu_futures, buffers
         )
         return
 
-    reporter.stage(key, "landmarks")
+    reporter.stage(key, "embedding" if track.get("needs_embedding") else "landmarks")
     samples = outcome["samples"]
     call = (
         samples,
-        bool(track["needs_landmarks"]),
-        bool(track["needs_features"]),
-        bool(track["needs_recording_fp"]),
+        bool(track.get("needs_landmarks")),
+        bool(track.get("needs_features")),
+        bool(track.get("needs_recording_fp")),
+        bool(track.get("needs_embedding")),
+        track.get("embedder_model", ""),
+        track.get("cache_dir", ""),
     )
     detail = {"stream_type": outcome["stream_type"], **outcome["timings"],
               "samples": int(samples.size)}
@@ -661,7 +730,7 @@ def _handle_fetch_result(future, track, reporter, cpu_pool, cpu_futures, buffers
 
 
 def _handle_analysis_result(future, track, detail, reporter, landmarks_buf, features_buf,
-                            recordings_buf, tracks_buf, cpu_pool, cpu_workers):
+                            recordings_buf, embeddings_buf, tracks_buf, cpu_pool, cpu_workers):
     key = track["id"]
     try:
         result = future.result()
@@ -681,18 +750,20 @@ def _handle_analysis_result(future, track, detail, reporter, landmarks_buf, feat
         return cpu_pool
 
     _store_result(track, result, detail, reporter,
-                  landmarks_buf, features_buf, recordings_buf, tracks_buf)
+                  landmarks_buf, features_buf, recordings_buf, embeddings_buf, tracks_buf)
     return cpu_pool
 
 
 def _store_result(track, result, detail, reporter,
-                  landmarks_buf, features_buf, recordings_buf, tracks_buf) -> None:
+                  landmarks_buf, features_buf, recordings_buf, embeddings_buf,
+                  tracks_buf) -> None:
     key = track["id"]
     reporter.stage(key, "commit")
 
     landmarks = result.get("landmarks") or []
     features = result.get("features")
     recording = result.get("recording_fp") or b""
+    embedding = result.get("embedding")
 
     if landmarks:
         landmarks_buf[key] = landmarks
@@ -700,15 +771,22 @@ def _store_result(track, result, detail, reporter,
         features_buf[key] = features
     if recording:
         recordings_buf[key] = (recording, int(track.get("durationMs") or 0))
+    if embedding:
+        embeddings_buf[key] = embedding
 
-    if not landmarks and not features and not recording:
+    if not landmarks and not features and not recording and not embedding:
         reporter.track_finished(key, "FAIL", "NO_OUTPUT", detail)
         return
 
     tracks_buf.add(key)
     summary = dict(detail)
     summary.update(result.get("timings", {}))
-    summary["landmarks"] = len(landmarks)
+    if landmarks:
+        summary["landmarks"] = len(landmarks)
+    if embedding:
+        # Segments, not bytes: 119 is a minute of audio, so the number says at a
+        # glance whether a track was read whole or truncated.
+        summary["segments"] = len(embedding[0]) // 128
     if features:
         summary["bpm"] = int(round(60 + features["tempo"] * 120))
         summary["energy"] = int(round(features["energy"] * 100))

@@ -85,6 +85,12 @@ def main(argv=None) -> int:
             print(f"[ERROR] {exc}")
             return 1
 
+        # Quantise our side too. The phone's file is what it stores -- int8 --
+        # so comparing raw float32 against it measures the quantiser rather than
+        # the engines, and even lets a cosine come out above 1.0 because only one
+        # side has been rounded off the unit sphere.
+        ours = embedder.unpack(embedder.pack(ours))
+
         print(f"phone:  {theirs.shape[0]} segments")
         print(f"here:   {ours.shape[0]} segments")
         if ours.shape[0] != theirs.shape[0]:
@@ -92,11 +98,13 @@ def main(argv=None) -> int:
                   "Compare `segment()` here with `AudioEmbedder.segment`.")
             return 1
 
-        # Cosine per segment. Both sides are unit vectors, so this is the dot
-        # product, and anything below ~0.999 is a real disagreement rather than
-        # the quantiser: the *input* is identical, so only the arithmetic can
-        # differ.
-        cos = np.sum(ours * theirs, axis=1)
+        # Cosine per segment, normalised rather than assumed: quantising moves
+        # each vector fractionally off the unit sphere. The *input* is identical
+        # and both sides are rounded the same way, so anything below ~0.999 is a
+        # real disagreement in the arithmetic.
+        cos = np.sum(ours * theirs, axis=1) / (
+            np.linalg.norm(ours, axis=1) * np.linalg.norm(theirs, axis=1)
+        )
         print(f"cosine: min {cos.min():.6f}  mean {cos.mean():.6f}  max {cos.max():.6f}")
 
         worst = int(np.argmin(cos))

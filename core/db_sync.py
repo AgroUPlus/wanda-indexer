@@ -10,6 +10,7 @@ clean up files damaged by the old behaviour.
 """
 import glob
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -40,6 +41,25 @@ EMBEDDINGS_DDL = (
 
 def ensure_embeddings_table(conn: sqlite3.Connection) -> None:
     conn.execute(EMBEDDINGS_DDL)
+
+
+LYRICS_DDL = (
+    "CREATE TABLE IF NOT EXISTS `track_lyrics` ("
+    "`trackId` TEXT NOT NULL, `plainLyrics` TEXT NOT NULL, `syncedLyrics` TEXT, "
+    "`source` TEXT NOT NULL, `syncedAt` INTEGER NOT NULL, "
+    "PRIMARY KEY(`trackId`))"
+)
+
+LYRICS_FTS_DDL = (
+    "CREATE VIRTUAL TABLE IF NOT EXISTS `lyrics_fts` USING fts4("
+    "`trackId` TEXT, `plainLyrics` TEXT, "
+    "tokenize=unicode61)"
+)
+
+
+def ensure_lyrics_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(LYRICS_DDL)
+    conn.execute(LYRICS_FTS_DDL)
 
 
 # Byte-for-byte the table Room validates at schema version 25 — see
@@ -836,6 +856,93 @@ def count_index_rows(db_path: str) -> Dict[str, Optional[int]]:
     return counts
 
 
+def deduplicate_by_embeddings(
+    db_path: str,
+    sim_threshold: float = 0.88,
+    duration_tolerance_ms: int = 3000,
+    log=print,
+) -> int:
+    """Finds and populates duplicate pairs into recording_links using neural embeddings."""
+    import numpy as np
+
+    conn = connect(db_path)
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS recording_links (
+                idA TEXT NOT NULL,
+                idB TEXT NOT NULL,
+                similarity REAL NOT NULL,
+                linkedAt INTEGER NOT NULL,
+                PRIMARY KEY(idA, idB)
+            );
+        """)
+        tracks = {
+            r[0]: r[1]
+            for r in cur.execute("SELECT id, durationMs FROM tracks WHERE durationMs > 0").fetchall()
+        }
+        embeddings = {}
+        mean_vectors = {}
+        for tid, blob in cur.execute(
+            "SELECT trackId, vector FROM track_embeddings WHERE model = ? AND version = ?",
+            (EMBED_MODEL_NAME, EMBEDDER_VERSION),
+        ).fetchall():
+            if tid not in tracks:
+                continue
+            arr = np.frombuffer(blob, dtype=">f4").reshape(-1, EMBED_DIM)
+            embeddings[tid] = arr
+            m = np.mean(arr, axis=0)
+            norm = np.linalg.norm(m)
+            mean_vectors[tid] = m / (norm if norm > 0 else 1.0)
+
+        track_ids = sorted(embeddings.keys(), key=lambda t: tracks[t])
+        durations = [tracks[t] for t in track_ids]
+
+        t0 = time.time()
+        candidates = []
+        for i in range(len(track_ids)):
+            d_i = durations[i]
+            m_i = mean_vectors[track_ids[i]]
+            for j in range(i + 1, len(track_ids)):
+                if durations[j] - d_i > duration_tolerance_ms:
+                    break
+                if np.dot(m_i, mean_vectors[track_ids[j]]) >= 0.75:
+                    candidates.append((track_ids[i], track_ids[j]))
+
+        links = []
+        now = int(time.time() * 1000)
+        for a, b in candidates:
+            va = embeddings[a]
+            vb = embeddings[b]
+            sim_mat = np.dot(va, vb.T)
+            score = float((np.mean(np.max(sim_mat, axis=1)) + np.mean(np.max(sim_mat, axis=0))) / 2.0)
+            if score >= sim_threshold:
+                id_a, id_b = (a, b) if a < b else (b, a)
+                links.append((id_a, id_b, score, now))
+
+        cur.executemany(
+            "INSERT OR REPLACE INTO recording_links (idA, idB, similarity, linkedAt) VALUES (?, ?, ?, ?);",
+            links,
+        )
+        conn.commit()
+        log(f"[DEDUP] Linked {len(links):,} duplicate recordings in {time.time() - t0:.2f}s")
+        return len(links)
+    finally:
+        conn.close()
+
+
+def drop_legacy_sub_hashes(db_path: str, log=print) -> None:
+    """Drops legacy sub-hash tables, freeing hundreds of megabytes."""
+    conn = connect(db_path)
+    try:
+        conn.execute("DROP TABLE IF EXISTS recording_sub_hashes;")
+        conn.execute("DROP TABLE IF EXISTS recording_fingerprints;")
+        conn.commit()
+        log("[CLEANUP] Dropped legacy recording_sub_hashes and recording_fingerprints tables.")
+    finally:
+        conn.close()
+
+
 # --------------------------------------------------------------------------
 # Writes
 # --------------------------------------------------------------------------
@@ -937,6 +1044,93 @@ def batch_insert_index_data(
         "sub_hashes": len(half_rows),
         "embeddings": len(embedding_rows),
     }
+
+
+def batch_insert_lyrics(db_path: str, lyrics_by_track: Dict[str, Dict[str, Any]]) -> int:
+    """Inserts or replaces lyrics in track_lyrics and lyrics_fts in a single transaction."""
+    if not lyrics_by_track:
+        return 0
+
+    now_ms = int(time.time() * 1000)
+    rows = []
+    for track_id, data in lyrics_by_track.items():
+        plain = (data.get("plainLyrics") or "").strip()
+        if not plain:
+            continue
+        synced = data.get("syncedLyrics")
+        source = data.get("source") or "LRCLIB"
+        synced_at = data.get("syncedAt") or now_ms
+        rows.append((track_id, plain, synced, source, synced_at))
+
+    if not rows:
+        return 0
+
+    fts_rows = [(r[0], r[1]) for r in rows]
+    track_ids = [(r[0],) for r in rows]
+
+    conn = connect(db_path)
+    try:
+        with conn:
+            ensure_lyrics_tables(conn)
+            conn.executemany("DELETE FROM lyrics_fts WHERE trackId = ?;", track_ids)
+            conn.executemany(
+                "INSERT OR REPLACE INTO track_lyrics (trackId, plainLyrics, syncedLyrics, source, syncedAt) "
+                "VALUES (?, ?, ?, ?, ?);",
+                rows,
+            )
+            conn.executemany(
+                "INSERT INTO lyrics_fts (trackId, plainLyrics) VALUES (?, ?);",
+                fts_rows,
+            )
+    finally:
+        conn.close()
+
+    return len(rows)
+
+
+def search_lyrics_fts(db_path: str, query: str, limit: int = 25) -> List[Dict[str, Any]]:
+    """Searches lyrics_fts for matching tracks and returns track details with highlighted snippets."""
+    clean_terms = [re.sub(r"[^\w]", "", term) for term in query.split() if term.strip()]
+    if not clean_terms:
+        return []
+    # Match prefix on last word to support incremental search
+    fts_query = " ".join(f"{term}*" if idx == len(clean_terms) - 1 else term for idx, term in enumerate(clean_terms))
+
+    conn = connect(db_path, readonly=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        ensure_lyrics_tables(conn)
+        has_tracks = bool(conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tracks';"
+        ).fetchone())
+
+        if has_tracks:
+            sql = """
+                SELECT l.trackId, l.plainLyrics, l.syncedLyrics, l.source,
+                       t.title, t.artist, t.album, t.durationMs,
+                       snippet(lyrics_fts, '<b>', '</b>', '...', -1, 12) AS snippet
+                FROM lyrics_fts f
+                JOIN track_lyrics l ON l.trackId = f.trackId
+                JOIN tracks t ON t.id = l.trackId
+                WHERE lyrics_fts MATCH ?
+                LIMIT ?;
+            """
+        else:
+            sql = """
+                SELECT l.trackId, l.plainLyrics, l.syncedLyrics, l.source,
+                       snippet(lyrics_fts, '<b>', '</b>', '...', -1, 12) AS snippet
+                FROM lyrics_fts f
+                JOIN track_lyrics l ON l.trackId = f.trackId
+                WHERE lyrics_fts MATCH ?
+                LIMIT ?;
+            """
+        rows = conn.execute(sql, (fts_query, limit)).fetchall()
+        return [dict(row) for row in rows]
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+
 
 
 def shrink_fingerprints_table(db_path: str, log=print) -> dict:

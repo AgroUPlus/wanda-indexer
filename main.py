@@ -355,6 +355,10 @@ def parse_args(argv=None):
     parser.add_argument("--push-overwrite", action="store_true",
                         help="Push without merging, replacing the phone's likes and history "
                              "with this database's copy of them")
+    parser.add_argument("--index-lyrics", action="store_true",
+                        help="Fetch and index song lyrics into track_lyrics and lyrics_fts")
+    parser.add_argument("--search-lyrics", default="", metavar="QUERY",
+                        help="Search lyrics_fts for QUERY in the SQLite database and display results")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show what would be indexed without touching the network")
     return parser.parse_args(argv)
@@ -411,6 +415,71 @@ def main(argv=None) -> int:
                 return 1
             db_sync.backfill_sub_hashes(working_db)
             db_sync.finalize_database(working_db)
+    if args.search_lyrics:
+        if not os.path.exists(args.db):
+            print(f"[ERROR] Database not found: {args.db}")
+            return 1
+        results = db_sync.search_lyrics_fts(args.db, args.search_lyrics)
+        if not results:
+            print(f"[LYRICS] No songs found matching: '{args.search_lyrics}'")
+            return 0
+        print(f"[LYRICS] Found {len(results)} match(es) for '{args.search_lyrics}':")
+        for r in results:
+            title = r.get("title") or r.get("trackId")
+            artist = r.get("artist") or "Unknown"
+            print(f"  • {title} - {artist}")
+            print(f"    Snippet: {r.get('snippet', '').strip()}")
+            if r.get("syncedLyrics"):
+                from core.lyrics_indexer import find_matching_lyric_line
+                ts, line = find_matching_lyric_line(r.get("plainLyrics"), r.get("syncedLyrics"), args.search_lyrics)
+                if ts is not None:
+                    sec = ts // 1000
+                    print(f"    Exact line [{sec//60:02d}:{sec%60:02d}]: \"{line}\"")
+        return 0
+
+    if args.index_lyrics:
+        if not os.path.exists(args.db):
+            print(f"[ERROR] Database not found: {args.db}")
+            return 1
+        from core import lyrics_indexer
+        conn = db_sync.connect(args.db)
+        db_sync.ensure_lyrics_tables(conn)
+        rows = conn.execute("""
+            SELECT t.id, t.title, t.artist, t.album, t.durationMs, t.localFilePath
+            FROM tracks t
+            LEFT JOIN track_lyrics l ON l.trackId = t.id
+            WHERE l.trackId IS NULL;
+        """).fetchall()
+        conn.close()
+
+        print(f"[LYRICS] {len(rows)} track(s) need lyrics indexing.")
+        if not rows:
+            return 0
+
+        lyrics_by_track = {}
+        found_count = 0
+        for idx, (tid, title, artist, album, duration_ms, local_path) in enumerate(rows, 1):
+            dur_s = (duration_ms / 1000.0) if duration_ms else None
+            lyric_data = None
+            if local_path:
+                lyric_data = lyrics_indexer.extract_local_tags_lyrics(local_path)
+            if not lyric_data:
+                lyric_data = lyrics_indexer.fetch_lrclib_lyrics(title, artist, album, dur_s)
+                time.sleep(0.25)
+            if lyric_data:
+                lyrics_by_track[tid] = lyric_data
+                found_count += 1
+                print(f"[{idx}/{len(rows)}] Found: {title} - {artist} ({lyric_data['source']})")
+            else:
+                print(f"[{idx}/{len(rows)}] No lyrics: {title} - {artist}")
+
+            if len(lyrics_by_track) >= 20:
+                db_sync.batch_insert_lyrics(args.db, lyrics_by_track)
+                lyrics_by_track.clear()
+
+        if lyrics_by_track:
+            db_sync.batch_insert_lyrics(args.db, lyrics_by_track)
+        print(f"[LYRICS] Indexed lyrics for {found_count}/{len(rows)} tracks.")
         return 0
 
     if args.shrink:
@@ -429,6 +498,7 @@ def main(argv=None) -> int:
             if staging.corrupt:
                 print("\n[ERROR] Database failed its integrity check. Run --repair first.")
                 return 1
+            db_sync.drop_legacy_sub_hashes(working_db)
             db_sync.shrink_fingerprints_table(working_db)
             db_sync.vacuum(working_db)
             db_sync.finalize_database(working_db)
@@ -699,8 +769,11 @@ def run_pipeline(args, pending, resolver, limiter, cache, reporter,
             commit_buffer(force=True)
         except Exception as exc:  # a failed final commit must still be reported
             reporter.log(f"[ERROR] Final checkpoint failed: {exc}")
-            exit_code = exit_code or 1
         cache.flush()
+
+    if exit_code == 0:
+        db_sync.deduplicate_by_embeddings(args.db, log=reporter.log)
+        db_sync.drop_legacy_sub_hashes(args.db, log=reporter.log)
 
     if args.push and exit_code == 0:
         # The app still declares the landmark entity, so a database that has had `fingerprints`

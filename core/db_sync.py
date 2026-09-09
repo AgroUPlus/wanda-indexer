@@ -1115,6 +1115,18 @@ def search_lyrics_fts(db_path: str, query: str, limit: int = 25) -> List[Dict[st
                 WHERE lyrics_fts MATCH ?
                 LIMIT ?;
             """
+            rows = conn.execute(sql, (fts_query, limit * 2)).fetchall()
+            results = []
+            seen = set()
+            for r in rows:
+                d = dict(r)
+                key = (d.get("title", "").strip().lower(), d.get("artist", "").strip().lower())
+                if key not in seen:
+                    seen.add(key)
+                    results.append(d)
+                if len(results) >= limit:
+                    break
+            return results
         else:
             sql = """
                 SELECT l.trackId, l.plainLyrics, l.syncedLyrics, l.source,
@@ -1124,8 +1136,8 @@ def search_lyrics_fts(db_path: str, query: str, limit: int = 25) -> List[Dict[st
                 WHERE lyrics_fts MATCH ?
                 LIMIT ?;
             """
-        rows = conn.execute(sql, (fts_query, limit)).fetchall()
-        return [dict(row) for row in rows]
+            rows = conn.execute(sql, (fts_query, limit)).fetchall()
+            return [dict(row) for row in rows]
     except sqlite3.OperationalError:
         return []
     finally:

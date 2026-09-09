@@ -450,6 +450,21 @@ def main(argv=None) -> int:
             LEFT JOIN track_lyrics l ON l.trackId = t.id
             WHERE l.trackId IS NULL;
         """).fetchall()
+
+        # Cache existing lyrics by (title, artist) so other sources (e.g. Navidrome vs YTM) reuse immediately
+        existing_rows = conn.execute("""
+            SELECT LOWER(t.title), LOWER(t.artist), l.plainLyrics, l.syncedLyrics, l.source
+            FROM track_lyrics l
+            JOIN tracks t ON t.id = l.trackId;
+        """).fetchall()
+        lyrics_cache_by_name = {
+            (r[0].strip(), r[1].strip()): {
+                "plainLyrics": r[2],
+                "syncedLyrics": r[3],
+                "source": f"{r[4]} (reused)"
+            }
+            for r in existing_rows if r[0] and r[1]
+        }
         conn.close()
 
         print(f"[LYRICS] {len(rows)} track(s) need lyrics indexing.")
@@ -461,13 +476,17 @@ def main(argv=None) -> int:
         for idx, (tid, title, artist, album, duration_ms, local_path) in enumerate(rows, 1):
             dur_s = (duration_ms / 1000.0) if duration_ms else None
             lyric_data = None
-            if local_path:
+            clean_name_key = (title.strip().lower(), artist.strip().lower())
+            if clean_name_key in lyrics_cache_by_name:
+                lyric_data = lyrics_cache_by_name[clean_name_key]
+            if not lyric_data and local_path:
                 lyric_data = lyrics_indexer.extract_local_tags_lyrics(local_path)
             if not lyric_data:
                 lyric_data = lyrics_indexer.fetch_lrclib_lyrics(title, artist, album, dur_s)
                 time.sleep(0.25)
             if lyric_data:
                 lyrics_by_track[tid] = lyric_data
+                lyrics_cache_by_name[clean_name_key] = lyric_data
                 found_count += 1
                 print(f"[{idx}/{len(rows)}] Found: {title} - {artist} ({lyric_data['source']})")
             else:

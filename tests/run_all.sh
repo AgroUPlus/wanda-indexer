@@ -6,7 +6,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 PYTHON="${PYTHON:-python3}"
 status=0
 
-for suite in test_golden_dsp test_sub_hashes test_pipeline test_progress test_stream_resolver test_db_integration; do
+for suite in test_golden_dsp test_sub_hashes test_pipeline test_progress test_stream_resolver test_db_integration test_user_data_merge; do
   echo "=== $suite ==="
   if ! "$PYTHON" "tests/$suite.py"; then
     echo "!!! $suite FAILED"

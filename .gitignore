@@ -9,3 +9,14 @@ __pycache__/
 *.corrupt-*
 *.rebuilt-*
 *.jsonl
+
+# The 34 MB embedder model. Shipped as the `embedder-v1` GitHub Release asset and downloaded at
+# runtime by the app, so the binary has no business in git history; models/README.md records how
+# to rebuild or fetch it. tools/build_embedder_tflite.py reproduces it exactly.
+models/*.tflite
+
+# SQLite leaves this behind when a transaction is interrupted.
+*.db-journal
+
+# Staged copy handed to adb by push.bat.
+wanda_push.db

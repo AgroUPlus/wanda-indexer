@@ -1,6 +1,11 @@
 # Core requirement.
 numpy>=1.24
 
+# Neural audio-fingerprint embeddings (core/embedder.py). Runs models/wanda_embedder.tflite.
+# 'ai-edge-litert' is the standalone TFLite runtime; a box with full 'tensorflow'
+# installed works too (core.embedder falls back to tensorflow.lite).
+ai-edge-litert>=1.0.1
+
 # Needed only for YouTube Music sources; install with the system package
 # manager if you prefer (it self-updates more reliably that way).
 yt-dlp>=2024.1.1

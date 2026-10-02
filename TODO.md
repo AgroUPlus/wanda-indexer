@@ -104,3 +104,27 @@ Instead of handcrafting DSP rules (STFT peak detection $\rightarrow$ 18,000 land
    - Add `org.tensorflow:tensorflow-lite:2.14.0` or `com.microsoft.onnxruntime:onnxruntime-android`.
    - Place `wanda_embedder.tflite` in `app/src/main/assets/`.
    - Update `RecognitionRepository` to evaluate microphone clips via the TFLite interpreter and run cosine similarity across loaded library vectors.
+
+### Status (2026-09-04)
+
+- **Model chosen**: `nmfp-triplet` from [raraz15/neural-music-fp](https://github.com/raraz15/neural-music-fp)
+  (ISMIR 2025, AGPL-3.0 — matches Wanda-main's AGPL-3.0). 8 kHz / 1 s / 0.5 s hop / 128-d, exactly
+  the existing pipeline's audio shape. Rejected MERT (CC-BY-NC + too heavy), pfann (no license).
+- **`models/wanda_embedder.tflite` built**: mel front-end folded into the graph (raw PCM
+  `(1,8000)` → `(1,128)`), builtins-only fp16, ~35 MB, cosine `1.0000` vs the float32 TF model.
+  Rebuild: `tools/build_embedder_tflite.py`. Provenance/licence: `models/README.md`.
+- **Desktop pipeline done** (`core/embedder.py`, `core/db_sync.py`, `main.py`): fourth extractor
+  alongside landmarks/features/recording, writes `track_embeddings`, `--embed-model` /
+  `--no-embed` flags, all existing tests pass. Landmarks still written in parallel (dual-index).
+- **Android side scaffolded, uncompiled**: `TrackEmbeddingEntity`/`Dao`, `MIGRATION_24_25`
+  (`@Database` → 25), `AudioEmbedder` (LiteRT), `EmbeddingRepository`, new
+  `RecognitionEngine.EMBEDDING` path in `RecognitionRepository`, 5th measurement in
+  `FingerprintIndexWorker`, `litert` gradle deps.
+- **Model is downloaded at runtime, not bundled** (`EmbeddingModelManager`): offered on the
+  first-run "Song recognition" card and in Settings → Fingerprints, fetched into `filesDir/`
+  and SHA-256-verified. Host as a GitHub Release asset (`embedder-v1` tag) — LFS bandwidth is
+  metered, release assets aren't. Keeps the APK small; recognition-by-embedding is simply off
+  until the download completes.
+- **Next**: publish the release asset; `gradlew assembleDebug` (generates schema `25.json`);
+  tune `EmbeddingRepository` `MIN_SIMILARITY` / `MIN_MARGIN` on the 44-duplicate-pair
+  benchmark (`tools/check_embedding_recognition.py`); then drop landmark writes.

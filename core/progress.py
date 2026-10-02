@@ -299,10 +299,15 @@ class ProgressReporter:
     def checkpoint(self, counts: dict) -> None:
         with self._lock:
             self.committed += counts.get("tracks", 0)
+            # Embeddings lead: they are what recognition reads now. Landmarks are reported only
+            # while a run still writes them, so a post-cut-over checkpoint does not carry a
+            # permanent "0 landmarks" that reads like a failure.
+            parts = [f"{counts.get('embeddings', 0)} embeddings",
+                     f"{counts.get('features', 0)} feature vectors"]
+            if counts.get("landmarks"):
+                parts.append(f"{counts['landmarks']:,} landmarks")
             message = (
-                f"[CHECKPOINT] {self.committed} tracks written "
-                f"({counts.get('landmarks', 0):,} landmarks, "
-                f"{counts.get('features', 0)} feature vectors)"
+                f"[CHECKPOINT] {self.committed} tracks written ({', '.join(parts)})"
             )
             self._write_jsonl({"ts": round(time.time(), 3), "event": "checkpoint", **counts})
             if self.plain:
